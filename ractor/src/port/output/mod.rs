@@ -14,6 +14,7 @@ use std::{fmt::Debug, sync::RwLock};
 
 use crate::{concurrency::JoinHandle, ActorId};
 use tokio::sync::broadcast as pubsub;
+use tracing::error;
 
 use crate::{ActorRef, Message};
 
@@ -159,15 +160,23 @@ impl OutputPortSubscription {
                         break;
                     }
                     msg = port.recv() => {
-                        if let Ok(Some(msg)) = msg {
-                            if let Some(new_msg) = converter(msg) {
-                                if receiver.cast(new_msg).is_err() {
-                                    return;
+                        match msg {
+                            Ok(Some(msg)) => {
+                                match converter(msg) {
+                                    Some(new_msg) => {
+                                        if receiver.cast(new_msg).is_err() {
+                                            return;
+                                        }
+                                    }
+                                    None => {}
                                 }
                             }
-                        }
-                        else {
-                            break;
+                            Ok(None) => {
+                                break;
+                            }
+                            Err(err) => {
+                                error!("Error receiving message from output port: {}", err);
+                            }
                         }
                     }
                 }
