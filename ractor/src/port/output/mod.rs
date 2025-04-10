@@ -12,7 +12,7 @@
 
 use std::{fmt::Debug, sync::RwLock};
 
-use crate::concurrency::JoinHandle;
+use crate::{concurrency::JoinHandle, ActorId};
 use tokio::sync::broadcast as pubsub;
 
 use crate::{ActorRef, Message};
@@ -90,6 +90,21 @@ where
         subs.push(sub);
     }
 
+    /// Unsubscribe from the output port
+    ///
+    /// * `receiver`: The reference which was subscribed to the output port
+    pub fn unsubscribe<TReceiverMsg>(&self, receiver: ActorRef<TReceiverMsg>)
+    where
+        TReceiverMsg: Message,
+    {
+        let mut subs = self.subscriptions.write().unwrap();
+
+        if let Some(idx) = subs.iter().position(|s| s.id == receiver.get_id()) {
+            let sub = subs.remove(idx);
+            sub.cancel();
+        }
+    }
+
     /// Send a message on the output port
     ///
     /// * `msg`: The message to send
@@ -107,12 +122,19 @@ where
 /// forwards it to the [ActorRef] asynchronously using the specified converter.
 struct OutputPortSubscription {
     handle: JoinHandle<()>,
+    id: ActorId,
+    oneshot: crate::concurrency::OneshotSender<()>,
 }
 
 impl OutputPortSubscription {
     /// Determine if the subscription is dead
     pub(crate) fn is_dead(&self) -> bool {
         self.handle.is_finished()
+    }
+
+    /// Cancel the subscription
+    pub(crate) fn cancel(self) {
+        let _ = self.oneshot.send(());
     }
 
     /// Create a new subscription
@@ -126,18 +148,37 @@ impl OutputPortSubscription {
         F: Fn(TMsg) -> Option<TReceiverMsg> + Send + 'static,
         TReceiverMsg: Message,
     {
+        let id = receiver.get_id();
+
+        let (oneshot, mut oneshot_rx) = crate::concurrency::oneshot();
+
         let handle = crate::concurrency::spawn(async move {
-            while let Ok(Some(msg)) = port.recv().await {
-                if let Some(new_msg) = converter(msg) {
-                    if receiver.cast(new_msg).is_err() {
-                        // kill the subscription process, as the forwarding agent is stopped
-                        return;
+            loop {
+                crate::concurrency::select! {
+                    _ = &mut oneshot_rx => {
+                        break;
+                    }
+                    msg = port.recv() => {
+                        if let Ok(Some(msg)) = msg {
+                            if let Some(new_msg) = converter(msg) {
+                                if receiver.cast(new_msg).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        else {
+                            break;
+                        }
                     }
                 }
             }
         });
 
-        Self { handle }
+        Self {
+            handle,
+            id,
+            oneshot,
+        }
     }
 }
 
@@ -279,6 +320,7 @@ impl OutputPortSubscription {
 /// }
 /// ```
 pub type OutputPortSubscriber<InputMessage> = Box<dyn OutputPortSubscriberTrait<InputMessage>>;
+
 /// A trait for subscribing to an [OutputPort]
 pub trait OutputPortSubscriberTrait<I>: Send
 where
@@ -286,6 +328,16 @@ where
 {
     /// Subscribe to the output port
     fn subscribe_to_port(&self, port: &OutputPort<I>);
+
+    /// Unsubscribe from the output port
+    fn unsubscribe_from_port(&self, port: &OutputPort<I>);
+
+    /// Subscribe to the output port with a converter
+    fn subscribe_to_port_with_converter(
+        &self,
+        port: &OutputPort<I>,
+        converter: Box<dyn Fn(I) -> Option<I> + Send + Sync + 'static>,
+    );
 }
 
 impl<I, O> OutputPortSubscriberTrait<I> for ActorRef<O>
@@ -295,5 +347,17 @@ where
 {
     fn subscribe_to_port(&self, port: &OutputPort<I>) {
         port.subscribe(self.clone(), |msg| Some(O::from(msg)));
+    }
+
+    fn unsubscribe_from_port(&self, port: &OutputPort<I>) {
+        port.unsubscribe(self.clone());
+    }
+
+    fn subscribe_to_port_with_converter(
+        &self,
+        port: &OutputPort<I>,
+        converter: Box<dyn Fn(I) -> Option<I> + Send + Sync + 'static>,
+    ) {
+        port.subscribe(self.clone(), move |msg| converter(msg).map(O::from));
     }
 }
