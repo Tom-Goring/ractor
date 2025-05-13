@@ -347,6 +347,8 @@ where
         port: &OutputPort<I>,
         converter: Box<dyn Fn(I) -> Option<I> + Send + Sync + 'static>,
     );
+
+    fn id(&self) -> ActorId;
 }
 
 impl<I, O> OutputPortSubscriberTrait<I> for ActorRef<O>
@@ -368,5 +370,9 @@ where
         converter: Box<dyn Fn(I) -> Option<I> + Send + Sync + 'static>,
     ) {
         port.subscribe(self.clone(), move |msg| converter(msg).map(O::from));
+    }
+
+    fn id(&self) -> ActorId {
+        self.get_id()
     }
 }
